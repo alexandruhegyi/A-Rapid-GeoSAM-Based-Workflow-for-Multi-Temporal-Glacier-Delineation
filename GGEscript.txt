@@ -1,0 +1,185 @@
+/**** GeoSAM glacier-ready time series: P25 + indices + cleaned ice mask (Aug 10–31)
+ *  AOI asset:
+ *    projects/fleet-space-249717/assets/AOI_GEE
+ *
+ *  Exports per year (to Google Drive, EPSG:25833):
+ *   - P25 composite (B2,B3,B4,B8,B11,B12)
+ *   - NDSI (from P25)
+ *   - NDVI (from P25)
+ *   - Cleaned candidate ice mask
+ ****/
+
+// =====================
+// 1) AOI
+// =====================
+var table = ee.FeatureCollection("projects/fleet-space-249717/assets/AOI_GEE");
+var aoi = table.geometry().simplify(10);
+
+Map.centerObject(aoi, 9);
+Map.addLayer(ee.Image().paint(aoi, 1, 2).selfMask(), {min:0, max:1}, "AOI outline");
+
+// =====================
+// 2) Config
+// =====================
+var startYear = 2017;
+var endYear   = 2024;
+
+// August-only window
+var startMonth = 8, startDay = 10;
+var endMonth   = 8, endDay   = 31;
+
+// Bands to export (GeoSAM-friendly)
+var bands = ["B2","B3","B4","B8","B11","B12"];
+
+// Cloud threshold (still use QA60 mask too)
+var maxCloudPct = 90;
+
+// ---- Ice candidate thresholds (tune if needed)
+var ndsiThresh = 0.40;   // common starting point
+var ndviMax    = 0.20;   // suppress vegetation
+
+// ---- Cleaning parameters
+var smoothRadiusMeters = 20;   // morphological smoothing (~2 pixels at 10 m)
+var minPatchArea_m2    = 5000; // remove small blobs (e.g., 0.005 km²). Tune.
+
+// ---- Export folder
+var outFolder = "GeoSAM_Aug10_31_P25_Indices_Mask";
+
+// =====================
+// 3) Sentinel-2 cloud mask (QA60)
+// =====================
+function maskS2sr(img) {
+  var qa = img.select("QA60");
+  var cloudBitMask  = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return img.updateMask(mask).copyProperties(img, ["system:time_start"]);
+}
+
+// Helper: build S2 collection for a year
+function s2ForYear(year) {
+  var start = ee.Date.fromYMD(year, startMonth, startDay);
+  var end   = ee.Date.fromYMD(year, endMonth, endDay);
+
+  return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", maxCloudPct))
+    .map(maskS2sr);
+}
+
+// =====================
+// 4) Indices + cleaning
+// =====================
+
+// Compute NDSI & NDVI from a composite image that includes the needed bands
+function addIndices(img) {
+  // NDSI = (Green - SWIR1) / (Green + SWIR1) = (B3 - B11)/(B3 + B11)
+  var ndsi = img.normalizedDifference(["B3","B11"]).rename("NDSI");
+
+  // NDVI = (NIR - Red) / (NIR + Red) = (B8 - B4)/(B8 + B4)
+  var ndvi = img.normalizedDifference(["B8","B4"]).rename("NDVI");
+
+  return img.addBands([ndsi, ndvi]);
+}
+
+// Build + clean ice mask from NDSI/NDVI
+function makeCleanIceMask(ndsi, ndvi) {
+  // Initial candidate
+  var ice0 = ndsi.gt(ndsiThresh).and(ndvi.lt(ndviMax)).rename("ICE0");
+
+  // Morphological smoothing: closing then opening
+  // Note: focal_* uses a kernel; using meters with EPSG:25833 works as expected.
+  var iceClosed = ice0.focal_max({radius: smoothRadiusMeters, units: "meters"})
+                     .focal_min({radius: smoothRadiusMeters, units: "meters"});
+  var iceSmooth = iceClosed.focal_min({radius: smoothRadiusMeters, units: "meters"})
+                          .focal_max({radius: smoothRadiusMeters, units: "meters"});
+
+  // Remove small patches by connected pixel count -> area threshold
+  var pxArea = ee.Image.pixelArea();
+  var connected = iceSmooth.selfMask().connectedPixelCount(256, true);
+
+  // approximate area = connectedPixels * (scale^2); but safer: label components and sum pixel area per component
+  // Lightweight approach: convert min area (m²) to min pixels at 10 m
+  var minPixels = ee.Number(minPatchArea_m2).divide(100); // 10m*10m = 100 m² per pixel
+  var iceBig = iceSmooth.updateMask(connected.gte(minPixels)).rename("ICE_MASK");
+
+  // Return as 0/1 (unmasked) for export convenience
+  return iceBig.unmask(0).toUint8();
+}
+
+// =====================
+// 5) Loop years: build P25 + exports
+// =====================
+for (var year = startYear; year <= endYear; year++) {
+
+  var s2 = s2ForYear(year);
+  print("Year", year, "S2 images in Aug10-31:", s2.size());
+
+  // ---- P25 composite (25th percentile)
+  var p25_raw = s2.select(bands).reduce(ee.Reducer.percentile([25])).clip(aoi);
+
+  // rename back to original band names (Reducer adds suffix)
+  var p25 = p25_raw.rename(bands);
+
+  // Add indices
+  var withIdx = addIndices(p25);
+  var ndsi = withIdx.select("NDSI");
+  var ndvi = withIdx.select("NDVI");
+
+  // Clean ice mask
+  var iceMask = makeCleanIceMask(ndsi, ndvi);
+
+  // Quick previews (off by default)
+  Map.addLayer(p25, {min:0, max:3000, bands:["B4","B3","B2"]}, "P25 " + year, false);
+  Map.addLayer(ndsi, {min:-1, max:1}, "NDSI " + year, false);
+  Map.addLayer(iceMask.selfMask(), {min:0, max:1}, "Ice mask " + year, false);
+
+  // ---- Exports (EPSG:25833)
+  Export.image.toDrive({
+    image: p25,
+    description: "GeoSAM_S2_" + year + "_Aug10_31_p25_25833",
+    folder: outFolder,
+    fileNamePrefix: "S2_" + year + "_Aug10_31_p25_EPSG25833",
+    region: aoi,
+    crs: "EPSG:25833",
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: ndsi,
+    description: "GeoSAM_S2_" + year + "_Aug10_31_NDSI_25833",
+    folder: outFolder,
+    fileNamePrefix: "S2_" + year + "_Aug10_31_NDSI_EPSG25833",
+    region: aoi,
+    crs: "EPSG:25833",
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: ndvi,
+    description: "GeoSAM_S2_" + year + "_Aug10_31_NDVI_25833",
+    folder: outFolder,
+    fileNamePrefix: "S2_" + year + "_Aug10_31_NDVI_EPSG25833",
+    region: aoi,
+    crs: "EPSG:25833",
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: iceMask,
+    description: "GeoSAM_S2_" + year + "_Aug10_31_ICE_MASK_25833",
+    folder: outFolder,
+    fileNamePrefix: "S2_" + year + "_Aug10_31_ICE_MASK_EPSG25833",
+    region: aoi,
+    crs: "EPSG:25833",
+    scale: 10,
+    maxPixels: 1e13
+  });
+}
+
