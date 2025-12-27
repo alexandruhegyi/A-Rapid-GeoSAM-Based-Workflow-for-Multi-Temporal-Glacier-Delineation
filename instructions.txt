@@ -1,0 +1,186 @@
+GeoSAM Glacier Time‐Series Workflow
+This wiki describes the full, step-by-step workflow for producing annual glacier masks and outlines using GeoSAM. The workflow combines Sentinel-2 late-summer composites, spectral indices, a candidate ice mask, automatically generated prompts for the Segment Anything Model (SAM), and physically based post-processing.
+
+The workflow is sequential. Each step depends on the outputs of the previous one and must be executed in order.
+
+Workflow overview
+
+The GeoSAM glacier workflow consists of four main stages:
+
+Preparation of an Area of Interest (AOI) and export of annual data from Google Earth Engine
+
+Organisation of exported GeoTIFFs into GeoSAM input folders
+
+Generation of SAM prompt boxes and points from the ice mask
+
+SAM-based segmentation, auto-gating, and vectorisation of glacier outlines
+
+Area of Interest (AOI) preparation
+
+A user-defined Area of Interest (AOI) is required. The AOI defines the spatial extent of all processing and must be prepared before running any scripts.
+
+Steps to prepare the AOI:
+
+Create a polygon representing your study area (for example in QGIS or directly in the Google Earth Engine Code Editor)
+
+Upload the polygon to Google Earth Engine as a FeatureCollection asset
+
+Store the asset in your personal or project GEE assets
+
+In the Google Earth Engine script, the AOI is loaded as a FeatureCollection and its geometry is used for all filtering, compositing, and exports. The user must replace the AOI asset path in the script with their own asset.
+
+Google Earth Engine preprocessing and exports
+
+The Google Earth Engine script generates all raster inputs required by GeoSAM.
+
+Processing steps:
+
+Sentinel-2 Surface Reflectance Harmonized imagery is used
+
+The temporal window is restricted to late summer (10–31 August) to reduce seasonal snow contamination
+
+Cloud and cirrus masking is applied using the QA60 band
+
+For each year, a 25th-percentile (P25) composite is calculated
+
+NDSI and NDVI are computed from the P25 composite
+
+A candidate ice mask is generated using NDSI and NDVI thresholds
+
+The ice mask is cleaned using morphological operations and a minimum-area filter
+
+Exports are written to Google Drive in EPSG:25833 at 10 m spatial resolution.
+
+Exported products per year:
+
+P25 composite (bands: B2, B3, B4, B8, B11, B12)
+
+NDSI
+
+NDVI
+
+ICE_MASK
+
+After the exports complete, all GeoTIFF files must be downloaded locally.
+
+Organising GeoSAM input data
+
+The script arrange_geosam_inputs.py prepares the folder structure required by GeoSAM.
+
+This script:
+
+Scans the directory containing downloaded Google Drive exports
+
+Automatically detects available years
+
+Copies and renames files into per-year folders
+
+Each year folder contains:
+
+P25.tif
+
+ICE_MASK.tif
+
+NDSI.tif
+
+NDVI.tif
+
+This step standardises filenames and ensures consistency for downstream processing.
+
+SAM prompt generation
+
+The script make_prompts_from_ice_mask.py generates the prompts used by SAM.
+
+For each connected ice region identified in the ICE_MASK:
+
+A bounding box is created with configurable padding
+
+Positive point prompts are sampled inside the ice region
+
+Negative point prompts are sampled in a buffer ring around the ice region
+
+The purpose of this step is to constrain SAM to plausible glacier areas and reduce false positives in surrounding terrain.
+
+Output files are written as GeoJSON:
+
+One file containing bounding boxes per year
+
+One file containing point prompts per year
+
+GeoSAM segmentation and auto-gating
+
+The script run_geosam_yearly.py performs the main GeoSAM processing.
+
+For each year:
+
+The P25 composite is converted to an 8-bit RGB image suitable for SAM
+
+SAM is run using the bounding boxes and point prompts
+
+Physical thresholds are automatically derived from ICE_MASK pixels:
+
+NDSI
+
+NDVI
+
+SWIR reflectance (B11)
+
+SAM outputs are gated using these thresholds to remove non-ice segments
+
+Optionally, morphological cleanup is applied to the raster mask
+
+The final glacier mask is polygonised
+
+Glacier outlines are filtered by area
+
+A smoothed vector version of the outlines is generated
+
+A valid SAM model checkpoint must be available in the models directory before running this step.
+
+Outputs
+
+For each processed year, GeoSAM produces the following outputs:
+
+Raster output:
+
+Annual glacier mask as a GeoTIFF
+
+Vector outputs:
+
+Raw glacier outlines as an ESRI Shapefile
+
+Smoothed glacier outlines as an ESRI Shapefile
+
+All outputs use the same projected coordinate reference system (i have used EPSG:25833, but it can be any).
+
+Folder structure
+
+The workflow assumes the following directory structure:
+
+Project root Date inputs prompts models sam_masks vectors
+
+Maintaining this structure is required for the scripts to run without modification.
+
+Notes and best practices
+
+Ensure all data are in EPSG:25833 (meters)
+
+The quality of the ICE_MASK strongly influences final results
+
+Visual inspection of outputs is strongly recommended
+
+Thresholds and parameters can be tuned in:
+
+the Google Earth Engine preprocessing script
+
+the prompt generation script
+
+the GeoSAM auto-gating configuration
+
+The workflow is designed to be semi-automatic; user oversight remains important in complex terrain
+
+Summary
+
+GeoSAM provides a fast, scalable, and reproducible approach for generating consistent glacier outlines across long Sentinel-2 time series. By combining physically based preprocessing with prompt-guided foundation-model segmentation, the workflow supports efficient glacier monitoring while retaining user control over spatial extent and quality assurance.
+
+
